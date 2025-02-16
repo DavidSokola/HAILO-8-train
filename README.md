@@ -1,78 +1,83 @@
-# HAILO-8-train
+Reasoned for a second
+Závěrečná zpráva (vhodné vysvětlení pro studenty)
 
-Analyzing compiler complexity
+Název: Pochopení konverze HAR → HEF pro YOLOv11 pomocí Hailo Dataflow Compileru
+1. Úvod
+Máte YOLOv11 model (neurální síť pro detekci objektů), který chcete provozovat na Hailo hardwaru. K tomu musíte nejprve model převést na HAR soubor (meziformát Hailo), a poté se Hailo Dataflow Compiler pokouší vyrobit soubor HEF (konečný „program“ pro Hailo čip). Tato zpráva shrnuje, co se během této konverze děje – především opakované „iterace“ (kroky) zobrazené v protokolech (logech) kompilátoru.
 
-I'm mulling over the Hailo dataflow compiler log, which highlights its struggle to map the YOLOv11 model efficiently. It’s fascinating to see how the iterative solver crafts a solution, balancing single and multi-context strategies to manage resource usage.
+2. Co jsou HAR a HEF
+HAR („Hailo Archive“)
+Můžete si ho představit jako mezikrok. Už máte natrénovaný model, vyexportujete jej do ONNX (například) a spustíte překlad. Ten pak vytvoří HAR, který je „téměř připraven“, ale je potřeba jej optimalizovat pro Hailo čip.
 
-Below is a high-level summary of what’s happening in these logs from the Hailo Dataflow Compiler as it tries to fit your YOLOv11 model (yolov11_model) into Hailo’s hardware resources and produce a single .hef. Note that these “iterations” in the log do not refer to training epochs; they are compiler solver iterations, where Hailo is attempting different internal mappings to fit your network within hardware constraints.
+HEF („Hailo Executable File“)
+Toto je výsledek, který se skutečně načte do Hailo hardwaru. Jakmile máte .hef, můžete na Hailo zařízení spouštět inference (vyhodnocování modelu).
 
-1. Single-Context Flow (Lines ~[2025-02-15 17:43:41.317] to [2025-02-15 17:45:28.943])
-“Trying to solve in single context”
-The compiler attempts to place your entire model in one context (a single “program” in Hailo’s hardware).
-If successful, you typically get maximum efficiency (higher FPS).
-“Model fits in single context ... but tries to increase utilization”
-It found an initial solution, used 142/154 LCUs (Layer Controllers), then tried to push usage for better performance.
-Several attempts to “apply higher utilization solution” fail.
-You see logs like “Too many resources,” “Number of layer controllers: 142 / 128,” etc.
-Eventually, the single-context approach fails with:
+3. Co nám ukazuje výpis z kompilátoru
+Při spuštění:
+
+css
+Copy
+Edit
+hailo_dataflow_compiler --input my_model.har --output my_model.hef
+(případně obdobného příkazu v Pythonu) kompilátor provádí následující:
+
+Pokus o Single-Context
+
+Kompilátor se nejprve pokusí umístit celý YOLO model do čipu jako jeden velký „blok“ (single context). To může přinést lepší výkon, ale často narazí na omezení zdrojů.
+V logu uvidíte např.:
 vbnet
 Copy
 Edit
-Single context flow failed: Recoverable single context error, continuing in multi context
-That means the compiler gave up on a single context.
-2. Multi-Context Flow (Lines ~[2025-02-15 17:45:45.874] onward)
-Two or More Contexts
-
-When a single context can’t handle the entire network, the compiler partitions the graph across multiple contexts in hardware.
-You see repeated logs like:
-nginx
-Copy
-Edit
-Iteration #1 - Contexts: 2, ...
-Iteration #2 - Contexts: 2, ...
+Model fits in single context ...
+Trying to apply higher utilization solution ...
 ...
-Each “iteration” tries a different partition approach—adjusting layer placements, merging, splitting, etc.—to fit the hardware constraints.
-Many Compiler Iterations
+Single context flow failed ...
+To znamená, že to zkusil, ale model použil příliš mnoho „layer controllers“ nebo paměti. Nakonec single context opustí.
+Pokus o Multi-Context
 
-Each iteration either fails (“Too many LCUs (130 > 128),” “Splitter timeout,” “Agent infeasible,” etc.) or finds partial improvements.
-The compiler logs a “Fast FPS” estimate each time, showing how it’s trying to optimize throughput.
-Timeouts / Resource Errors
+Protože single context se nepodařilo, kompilátor model rozdělí do dvou nebo tří kontextů. Každý kontext je jako další „část programu“ na čipu.
+Kompilátor tak opakovaně zkouší různé uspořádání (tzv. „iterace“), kde nastavuje, jak se vrstvy modelu sdružují či dělí. Některé iterace selžou („Too many LCUs“, „Splitter timeout“), jiné najdou částečné řešení a zvýší „Fast FPS“.
+Iterace #1, #2, #3 ...
 
-"Splitter timeout" indicates the compiler spent too long exploring possible placements for that context partition.
-"Too many lcus (130 > 128)" means the partition still needs more layer controllers than physically available.
-"Validator failed on node" means the final pass found an infeasible arrangement for a certain kernel shape, alignment, or scheduling on that subgraph.
-Eventually Reaches a Valid / Best Solution
+Každá iterace je jeden pokus interního „solveru“ (řešiče) o nové mapování.
+Selhání mohou být:
+Splitter timeout: v daném kroku strávil řešič příliš času hledáním proveditelného uspořádání.
+Too many LCUs: čip má jen 128 „layer controllers“, ale model potřebuje třeba 130 či 142.
+Validator failed: někde nevyhovuje rozměr konvoluce pravidlům paměťového zarovnání.
+Co se stane nakonec
 
-You’ll see messages like “Fast FPS: XXX (best: YYY),” which suggests it found a feasible mapping that tries to maximize frames per second.
-If it completely fails, you’d see a “compilation error.” But from lines near [2025-02-15 20:08:43], it started finding partial solutions, logging best: 165.156 FPS, etc.
-Important: As soon as the compiler finds a workable solution that passes validation and fits hardware constraints, it can finalize. If it never finds a feasible solution, compilation fails with an error.
+Kompilátor buď najde validní rozdělení a vytvoří .hef, nebo (pokud se to nepodaří) selže úplně.
+Pozor: Tyto iterace nejsou trénovací epochy. Jde o kompilační kroky, jak fyzicky umístit „tensory“ (data neuronové sítě) do pamětí a výpočetních bloků v čipu.
 
-3. Why So Many Iterations?
-The Hailo Compiler is iteratively searching for the optimal resource mapping (or a near-optimal) to get the highest performance.
-Each iteration tries either:
-A new layout in multi-context mode.
-Merges certain layers to reduce overhead.
-Re-partitions the graph to see if it can squeeze out better FPS.
-When the compiler logs “Splitter timeout” or “Too many lcus (130 > 128),” that iteration’s approach fails, and it tries again with a different approach.
-4. Potential Outcomes
-Successful Compile
+4. Co jsou tensory a proč se optimalizují
+Tensory:
+V deep learningu je „tensor“ vícerozměrné pole (např. 2D obraz či 4D batch obrazů). Každá vrstva v YOLO zpracovává určité pole (Height × Width × Channels).
 
-The compiler eventually finds a partition that passes all validations, then writes the .hef file.
-You’ll see a final line like “Compilation completed successfully” or a Python message indicating runner.compile() succeeded.
-Failed Compile
+Optimalizace v Hailo:
+Čip má striktní hardwarové meze na počty kanálů či „layer controllers“ atd. Kompilátor se snaží těmito tensory „šoupat“ tak, aby se vešly.
 
-If it exhausts its search space or hits a core constraint (e.g., a kernel shape incompatible with memory alignment), you get a final error stating it couldn’t compile the model.
-Extended Compile Time
+U velkého modelu je často nezbytné jej rozdělit do víc kontextů, aby nepřekročil kapacitu jediné části čipu.
+5. Shrnutí Logu
+Single Context:
 
-A large or complex model can cause many solver iterations.
-This can take a long time (tens of minutes or even hours, as you see from the timestamps).
-5. What It Means for You
-Not a Training Issue: These iteration logs are purely compiler optimization steps, not training epochs.
-Multi-Context: If single context can’t fit the model, it’s normal to see multi-context logs. The compiler tries 2 contexts, then 3, etc.
-Model Complexity: Your YOLO variant might be large (lots of layers), pushing the hardware to its limits.
-Potential Remedies:
-Try a smaller model or a “pruned” version if compilation fails or if it’s taking too long.
-If you have control over the network architecture, ensure kernel shapes and feature-map widths align better with Hailo constraints.
-Check that you’re using the latest Hailo Dataflow Compiler; some versions have improved heuristics for big models.
-TL;DR
-You’re seeing the Hailo Compiler iterating through many internal attempts to fit your YOLOv11 model on the chip. Each “iteration” adjusts the layer assignments or tries new merges, aiming for a valid, optimal multi-context solution. If it ultimately finds a valid mapping, you’ll get a .hef; if not, it fails. These logs confirm the compiler is doing a complex resource allocation process—not training—and each iteration is one pass of the solver’s approach to placing your model in hardware.
+Log ukazuje „Model fits in single context“, ale pak se snaží „increase utilization“ (zvýšit využití a výkon). Nakonec to narazí na limit (např. 129 > 128).
+Nezdaří se, takže to přejde na multi-context.
+Multi-Context:
+
+Vidíte „Iteration #1 ... Iteration #114“ i více. Každá iterace zkouší jiné rozložení vrstev a pamětí. Některé kódy hlásí „Splitter timeout“, jiné „Too many lcus (130 > 128)“.
+Někdy stoupá „Fast FPS“ (odhad snímků za vteřinu). Kompilátor hledá nejrychlejší proveditelnou variantu.
+6. Výsledky a doporučení
+Zda se kompilátor podaří
+
+Pokud nakonec uvidíte „Compile completed successfully“ a vznikne .hef, znamená to, že se rozdělení povedlo.
+Pokud končí chybou a .hef nevznikne, je model příliš velký či jinak nevyhovuje.
+Chcete-li rychlejší či snazší kompatibilitu
+
+Zvažte menší variantu YOLO (např. YOLOv5n nebo YOLOv8n) či ořez (pruning).
+Případně si nastudujte doporučení Hailo k velikosti jader, zarovnání atd.
+7. Závěrem (pro 17letého studenta)
+Představte si, že čip je „garáž“ s určitým počtem parkovacích míst.
+Model YOLO jsou „auta“, která tam chcete zaparkovat.
+„Single context“ je snaha nacpat všechna auta do jedné velké sekce. „Multi-context“ je rozdělit auta do více oddělených sekcí.
+Výpis (log) ukazuje, jak se kompilátor snaží auta různě přeskupovat, někdy selže (auta se nevejdou, špatná velikost kol v určité části). Nakonec (snad) najde funkční uspořádání. To je váš .hef.
+Tak hodně štěstí s používáním Hailo compileru a nasazováním YOLO modelu na reálný hardware. Pochopení těchto logů vám ukáže, že nejde o trénování, ale o fyzické umístění neuronové sítě na čip, abyste mohli v reálném čase detekovat objekty.
